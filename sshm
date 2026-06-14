@@ -1,0 +1,1018 @@
+#!/bin/bash
+
+VERSION="2.3.1"
+SCRIPT_NAME="sshm"
+CONFIG_DIR="$HOME/.config/sshm"
+CONFIG_FILE="$CONFIG_DIR/sshm.json"
+HISTORY_FILE="$CONFIG_DIR/history"
+MOUNT_DIR="$HOME/mnt"
+
+DEBUG=false
+VERBOSE=false
+IGNORE_HOSTS=false
+PERSISTENT=false
+
+# Colors for output (only use if stdout/stderr is a terminal)
+if [[ -t 1 ]] && [[ -t 2 ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'
+    CYAN='\033[0;36m'
+    GRAY='\033[0;90m'
+    NC='\033[0m' # No Color
+else
+    # No colors if output is redirected
+    RED=''
+    GREEN=''
+    YELLOW=''
+    BLUE=''
+    CYAN=''
+    GRAY=''
+    NC=''
+fi
+
+# Default settings
+DEFAULT_PORT=22
+DEFAULT_REMOTE_PATH="/"
+DEFAULT_SFTP_SERVER="/usr/lib/ssh/sftp-server"
+DEFAULT_OPTIONS="-o 'sftp_server=sudo /usr/lib/ssh/sftp-server',idmap=user,reconnect,ServerAliveInterval=15,ServerAliveCountMax=3"
+
+usage() {
+    cat << EOF
+SSHM - SSH File System Mount Manager v$VERSION
+
+USAGE:
+    $SCRIPT_NAME <hostname>                 # Mount hostname with defaults
+    $SCRIPT_NAME <user@hostname>            # Mount with specific user
+    $SCRIPT_NAME [command] [options]
+
+QUICK EXAMPLES:
+    $SCRIPT_NAME myserver                   # Mount myserver (uses saved config or defaults)
+    $SCRIPT_NAME user@example.com           # Mount with user@host
+    $SCRIPT_NAME webserver.internal          # Mount using FQDN
+    
+COMMANDS:
+    mount <server>          Mount a remote server (same as just passing a hostname)
+    umount <server>         Unmount a mounted server
+    list                    List all active SSHFS mounts
+    add <server>            Add or update a server configuration interactively
+    edit <server>           Edit an existing server configuration
+    remove <server>         Remove a server configuration
+    status                  Show configuration and mount status
+    config                  Show current configuration file
+
+OPTIONS:
+    -i, --ignore            Ignore known hosts checking (StrictHostKeyChecking=no)
+    -p, --persistent        Make mount persistent across reboots (adds to /etc/fstab)
+    -d, --debug             Enable debug output (also passes -d to sshfs)
+    -v, --verbose           Show verbose output (implies --debug)
+    -c, --clear             Clear SSHM mount history
+    --init                  Initialize SSHM configuration directory and defaults
+    --version               Show version information
+    -?, -h, --help          Show this help message
+
+CONFIGURATION:
+    Config stored in: $CONFIG_FILE
+    
+    Default settings:
+    - Port: $DEFAULT_PORT
+    - Remote path: $DEFAULT_REMOTE_PATH
+    - Mount path: $MOUNT_DIR/<hostname>
+    - Options: $DEFAULT_OPTIONS
+
+EXAMPLES:
+    # Quick mounting (uses defaults or saved config)
+    $SCRIPT_NAME myserver
+    $SCRIPT_NAME admin@fileserver.example.com
+    $SCRIPT_NAME -p myserver                # Mount and add persistent entry to /etc/fstab
+    $SCRIPT_NAME -i myserver                # Mount without host key verification
+    
+    # Configuration management
+    $SCRIPT_NAME add myserver               # Add/update server with interactive prompts
+    $SCRIPT_NAME edit myserver              # Edit existing server config
+    $SCRIPT_NAME remove myserver            # Remove server from config
+    $SCRIPT_NAME list                       # Show all active SSHFS mounts
+    $SCRIPT_NAME status                     # Show config + active mounts
+    $SCRIPT_NAME umount myserver            # Unmount server
+
+NOTES:
+    Servers are automatically saved to the config on first mount.
+    Persistent mounts (-p) require an SSH identity file at:
+      ~/.ssh/id_ed25519_<hostname>
+
+EOF
+}
+
+log_debug() {
+    if [[ "$DEBUG" == true ]]; then
+        echo -e "${GRAY}[DEBUG]${NC} $*" >&2
+    fi
+}
+
+log_verbose() {
+    if [[ "$VERBOSE" == true ]]; then
+        echo -e "${CYAN}[VERBOSE]${NC} $*" >&2
+    fi
+}
+
+log_warning() {
+    echo -e "${YELLOW}[WARN]${NC} $*" >&2
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $*" >&2
+}
+
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $*"
+}
+
+# Check if jq is available
+check_jq() {
+    if ! command -v jq &> /dev/null; then
+        log_error "jq is required but not installed. Please install jq to continue."
+        echo "On Arch Linux: sudo pacman -S jq"
+        exit 1
+    fi
+}
+
+# Detect sftp-server location and return the path
+detect_sftp_server() {
+    log_debug "Detecting sftp-server location"
+    
+    # Common locations for sftp-server
+    local common_paths=(
+        "/usr/lib/ssh/sftp-server"
+        "/usr/libexec/sftp-server"
+        "/usr/lib/openssh/sftp-server"
+        "/usr/local/libexec/sftp-server"
+        "/usr/local/lib/ssh/sftp-server"
+        "/opt/ssh/libexec/sftp-server"
+    )
+    
+    # Check common locations first
+    for path in "${common_paths[@]}"; do
+        if [[ -x "$path" ]]; then
+            log_verbose "Found sftp-server at: $path"
+            echo "$path"
+            return 0
+        fi
+    done
+    
+    log_verbose "sftp-server not found in common locations"
+    
+    # Ask user if they want to perform a deep search
+    echo -e "${YELLOW}[WARN]${NC} sftp-server not found in common locations:" >&2
+    for path in "${common_paths[@]}"; do
+        echo "  $path" >&2
+    done
+    echo "" >&2
+    echo -e -n "${BLUE}Would you like to perform a system-wide search? This may take some time. [y/N]:${NC} " >&2
+    read -r response
+    
+    if [[ "$response" =~ ^[Yy]$ ]]; then
+        log_info "Performing system-wide search for sftp-server..."
+        
+        # Try to find sftp-server using various methods
+        local found_path=""
+        
+        # Method 1: Use find command (faster, common locations first)
+        local search_dirs=("/usr" "/opt" "/usr/local")
+        for dir in "${search_dirs[@]}"; do
+            if [[ -d "$dir" ]]; then
+                log_debug "Searching in $dir for sftp-server"
+                found_path=$(find "$dir" -name "sftp-server" -type f -executable 2>/dev/null | head -1)
+                if [[ -n "$found_path" ]]; then
+                    log_info "Found sftp-server at: $found_path"
+                    echo "$found_path"
+                    return 0
+                fi
+            fi
+        done
+        
+        # Method 2: Use locate if available (much faster)
+        if command -v locate &> /dev/null; then
+            log_debug "Using locate to search for sftp-server"
+            found_path=$(locate sftp-server 2>/dev/null | grep -E '/(sftp-server)$' | head -1)
+            if [[ -n "$found_path" && -x "$found_path" ]]; then
+                log_info "Found sftp-server via locate: $found_path"
+                echo "$found_path"
+                return 0
+            fi
+        fi
+        
+        # Method 3: Last resort - full system search (very slow)
+        log_debug "Performing full system search (this may take a while)"
+        found_path=$(find / -name "sftp-server" -type f -executable 2>/dev/null | head -1)
+        if [[ -n "$found_path" ]]; then
+            log_info "Found sftp-server at: $found_path"
+            echo "$found_path"
+            return 0
+        fi
+    fi
+    
+    log_error "sftp-server not found on system"
+    echo -e "${YELLOW}[WARN]${NC} Continuing with default path: /usr/lib/ssh/sftp-server" >&2
+    echo -e "${YELLOW}[WARN]${NC} You may need to install openssh-server or adjust the path manually" >&2
+    echo "/usr/lib/ssh/sftp-server"
+    return 1
+}
+
+# Get default options with detected sftp-server path
+get_default_options() {
+    local sftp_server_path="$1"
+    if [[ -z "$sftp_server_path" ]]; then
+        sftp_server_path="$DEFAULT_SFTP_SERVER"
+    fi
+    echo "-o 'sftp_server=sudo $sftp_server_path',idmap=user,reconnect,ServerAliveInterval=15,ServerAliveCountMax=3"
+}
+
+# Check that the config file exists, is valid JSON, and has complete defaults
+config_defaults_valid() {
+    [[ -f "$CONFIG_FILE" ]] || return 1
+    # Must parse as JSON
+    jq -e . "$CONFIG_FILE" > /dev/null 2>&1 || return 1
+    # Required defaults must be present and non-empty
+    jq -e '
+        (.defaults // {}) as $d
+        | ($d.port != null)
+        and (($d.remotePath // "") != "")
+        and (($d.mountDir // "") != "")
+        and (($d.options // "") != "")
+    ' "$CONFIG_FILE" > /dev/null 2>&1
+}
+
+# Write a fresh config file with default settings (overwrites $CONFIG_FILE).
+# Uses jq -n so values are always JSON-encoded correctly.
+write_default_config() {
+    local options="$1"
+    jq -n \
+        --arg version "$VERSION" \
+        --argjson port "$DEFAULT_PORT" \
+        --arg remotePath "$DEFAULT_REMOTE_PATH" \
+        --arg mountDir "$MOUNT_DIR" \
+        --arg options "$options" \
+        '{
+            version: $version,
+            defaults: {
+                port: $port,
+                remotePath: $remotePath,
+                mountDir: $mountDir,
+                options: $options
+            },
+            servers: {}
+        }' > "$CONFIG_FILE"
+}
+
+# Repair a config file with missing/invalid defaults, preserving saved servers
+repair_config_defaults() {
+    local options="$1"
+    local temp_config
+    temp_config=$(mktemp)
+
+    if jq -e . "$CONFIG_FILE" > /dev/null 2>&1; then
+        # Valid JSON: rebuild the defaults block, keep any existing servers
+        if jq \
+            --arg version "$VERSION" \
+            --argjson port "$DEFAULT_PORT" \
+            --arg remotePath "$DEFAULT_REMOTE_PATH" \
+            --arg mountDir "$MOUNT_DIR" \
+            --arg options "$options" \
+            '.version = $version
+             | .defaults = {
+                 port: $port,
+                 remotePath: $remotePath,
+                 mountDir: $mountDir,
+                 options: $options
+               }
+             | .servers = (.servers // {})' \
+            "$CONFIG_FILE" > "$temp_config"; then
+            mv "$temp_config" "$CONFIG_FILE"
+        else
+            rm -f "$temp_config"
+            log_error "Failed to repair config defaults in $CONFIG_FILE"
+            return 1
+        fi
+    else
+        # Unparseable: back up the broken file and start fresh
+        rm -f "$temp_config"
+        local backup="${CONFIG_FILE}.corrupt.bak"
+        cp "$CONFIG_FILE" "$backup" 2>/dev/null && \
+            log_info "Backed up unreadable config to: $backup"
+        write_default_config "$options"
+    fi
+    return 0
+}
+
+init_config() {
+    log_verbose "Initializing SSHM configuration"
+
+    check_jq
+
+    # Detect sftp-server location and build default options
+    local sftp_server_path detected_options
+    sftp_server_path=$(detect_sftp_server)
+    detected_options=$(get_default_options "$sftp_server_path")
+
+    if [[ ! -d "$CONFIG_DIR" ]]; then
+        mkdir -p "$CONFIG_DIR"
+        log_debug "Created config directory: $CONFIG_DIR"
+    fi
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        write_default_config "$detected_options"
+        log_info "Created default config file: $CONFIG_FILE"
+    elif ! config_defaults_valid; then
+        log_error "Config file $CONFIG_FILE is invalid or missing defaults; repairing..."
+        repair_config_defaults "$detected_options"
+        log_info "Repaired config defaults in: $CONFIG_FILE"
+    fi
+
+    if [[ ! -d "$MOUNT_DIR" ]]; then
+        mkdir -p "$MOUNT_DIR"
+        log_debug "Created mount directory: $MOUNT_DIR"
+    fi
+
+    if [[ ! -f "$HISTORY_FILE" ]]; then
+        touch "$HISTORY_FILE"
+        log_debug "Created history file: $HISTORY_FILE"
+    fi
+
+    log_info "SSHM configuration initialized successfully"
+}
+
+# Ensure a usable config exists before reading it. Run from normal (non-captured)
+# context so init/repair log output isn't swallowed by command substitution.
+ensure_config() {
+    config_defaults_valid || init_config
+}
+
+# Parse hostname/user@hostname to extract components
+parse_connection_string() {
+    local conn_string="$1"
+    local user=""
+    local hostname=""
+    
+    if [[ "$conn_string" == *"@"* ]]; then
+        user="${conn_string%@*}"
+        hostname="${conn_string#*@}"
+    else
+        hostname="$conn_string"
+    fi
+    
+    echo "$user|$hostname"
+}
+
+# Get server config from JSON, return as key=value pairs
+get_server_config() {
+    local server_name="$1"
+    
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        log_error "Configuration file not found. Run '$SCRIPT_NAME --init' to initialize."
+        return 1
+    fi
+    
+    check_jq
+    
+    # Check if server exists in config
+    if jq -e ".servers[\"$server_name\"]" "$CONFIG_FILE" > /dev/null 2>&1; then
+        local config
+        config=$(jq -r ".servers[\"$server_name\"] as \$server | .defaults as \$defaults | 
+                 \"user=\" + (\$server.user // \"\") + \"|\" +
+                 \"hostname=\" + (\$server.hostname // \"\") + \"|\" +
+                 \"port=\" + (\$server.port // \$defaults.port | tostring) + \"|\" +
+                 \"remotePath=\" + (\$server.remotePath // \$defaults.remotePath) + \"|\" +
+                 \"localPath=\" + (\$server.localPath // (\$defaults.mountDir + \"/\" + \"$server_name\")) + \"|\" +
+                 \"options=\" + (\$server.options // \$defaults.options)" "$CONFIG_FILE")
+        echo "$config"
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Get default config for a hostname
+get_default_config() {
+    local hostname="$1"
+    local user="$2"
+
+    # Repair the config if needed; redirect setup output to stderr so it does
+    # not contaminate the config string captured via command substitution
+    config_defaults_valid || init_config 1>&2
+
+    check_jq
+    
+    local config
+    config=$(jq -r ".defaults as \$defaults | 
+             \"user=\" + \"$user\" + \"|\" +
+             \"hostname=\" + \"$hostname\" + \"|\" +
+             \"port=\" + (\$defaults.port | tostring) + \"|\" +
+             \"remotePath=\" + \$defaults.remotePath + \"|\" +
+             \"localPath=\" + (\$defaults.mountDir + \"/\" + \"$hostname\") + \"|\" +
+             \"options=\" + \$defaults.options" "$CONFIG_FILE")
+    echo "$config"
+}
+
+# Add or update server configuration
+add_server() {
+    local server_name="$1"
+    local batch_mode="$2"
+    
+    if [[ -z "$server_name" ]]; then
+        log_error "Server name is required"
+        return 1
+    fi
+    
+    # Prevent command names from being used as server names
+    case "$server_name" in
+        mount|umount|list|add|edit|remove|status|config)
+            log_error "Cannot use command name '$server_name' as a server name"
+            return 1
+            ;;
+    esac
+    
+    check_jq
+    init_config
+    
+    # Parse if it's a connection string
+    local parsed
+    parsed=$(parse_connection_string "$server_name")
+    local provided_user="${parsed%|*}"
+    local provided_hostname="${parsed#*|}"
+    
+    # If it looks like user@hostname, use hostname as server name
+    if [[ -n "$provided_user" ]]; then
+        server_name="$provided_hostname"
+    fi
+    
+    local user="$provided_user"
+    local hostname="$provided_hostname"
+    local port="$DEFAULT_PORT"
+    local remote_path="$DEFAULT_REMOTE_PATH"
+    local local_path="$MOUNT_DIR/$server_name"
+    local options="$DEFAULT_OPTIONS"
+    
+    # Get existing config if it exists
+    if get_server_config "$server_name" > /dev/null 2>&1; then
+        if [[ "$batch_mode" != "batch" ]]; then
+            echo "Server '$server_name' already exists. Updating configuration..."
+        fi
+        local existing_config
+        existing_config=$(get_server_config "$server_name")
+        
+        # Parse existing config
+        while IFS='=' read -r key value; do
+            case "$key" in
+                "user") [[ -z "$user" ]] && user="$value" ;;
+                "hostname") [[ -z "$hostname" ]] && hostname="$value" ;;
+                "port") port="$value" ;;
+                "remotePath") remote_path="$value" ;;
+                "localPath") local_path="$value" ;;
+                "options") options="$value" ;;
+            esac
+        done <<< "$(echo "$existing_config" | tr '|' '\n')"
+    fi
+    
+    # Interactive mode - ask for details
+    if [[ "$batch_mode" != "batch" ]]; then
+        echo -e "${CYAN}Configuring server: $server_name${NC}"
+        echo -e -n "${BLUE}User (current: '$user'):${NC} "
+        read -r input_user
+        [[ -n "$input_user" ]] && user="$input_user"
+        
+        echo -e -n "${BLUE}Hostname (current: '$hostname'):${NC} "
+        read -r input_hostname  
+        [[ -n "$input_hostname" ]] && hostname="$input_hostname"
+        
+        echo -e -n "${BLUE}Port (current: $port):${NC} "
+        read -r input_port
+        [[ -n "$input_port" ]] && port="$input_port"
+        
+        echo -e -n "${BLUE}Remote path (current: '$remote_path'):${NC} "
+        read -r input_remote
+        [[ -n "$input_remote" ]] && remote_path="$input_remote"
+        
+        echo -e -n "${BLUE}Local mount point (current: '$local_path'):${NC} "
+        read -r input_local
+        [[ -n "$input_local" ]] && local_path="$input_local"
+        
+        echo -e -n "${BLUE}SSH/SSHFS options (current: '$options'):${NC} "
+        read -r input_options
+        [[ -n "$input_options" ]] && options="$input_options"
+    fi
+    
+    # Validate required fields
+    if [[ -z "$hostname" ]]; then
+        log_error "Hostname is required"
+        return 1
+    fi
+    # No need to escape single quotes for JSON
+    local options_escaped="$options"
+    # Update JSON config
+    local temp_config
+    temp_config=$(mktemp)
+    jq ".servers[\"$server_name\"] = {
+        \"user\": \"$user\",
+        \"hostname\": \"$hostname\",
+        \"port\": $port,
+        \"remotePath\": \"$remote_path\", 
+        \"localPath\": \"$local_path\",
+        \"options\": \"$options_escaped\"
+    }" "$CONFIG_FILE" > "$temp_config" && mv "$temp_config" "$CONFIG_FILE"
+    
+    if [[ "$batch_mode" != "batch" ]]; then
+        log_info "Server '$server_name' configuration saved"
+    fi
+}
+
+# Main mount function
+mount_server() {
+    local server_input="$1"
+    
+    if [[ -z "$server_input" ]]; then
+        log_error "Server name or connection string is required"
+        return 1
+    fi
+    
+    # Prevent command names from being used as server names
+    case "$server_input" in
+        mount|umount|list|add|edit|remove|status|config)
+            log_error "Cannot use command name '$server_input' as a server name"
+            return 1
+            ;;
+    esac
+    
+    # Parse the input
+    local parsed
+    parsed=$(parse_connection_string "$server_input")
+    local provided_user="${parsed%|*}"
+    local provided_hostname="${parsed#*|}"
+    
+    local server_name="$provided_hostname"
+    local config=""
+    
+    # Try to get saved config first
+    if get_server_config "$server_name" > /dev/null 2>&1; then
+        config=$(get_server_config "$server_name")
+        log_verbose "Using saved configuration for '$server_name'"
+    elif get_server_config "$server_input" > /dev/null 2>&1; then
+        # Try the full input as server name
+        server_name="$server_input"
+        config=$(get_server_config "$server_input")
+        log_verbose "Using saved configuration for '$server_input'"
+    else
+        # Use defaults
+        config=$(get_default_config "$provided_hostname" "$provided_user")
+        log_verbose "Using default configuration for '$provided_hostname'"
+        
+        # Auto-save the config for next time (in batch mode)
+        add_server "$server_input" "batch"
+    fi
+    
+    # Parse config
+    local user="" hostname="" port="" remote_path="" local_path="" options=""
+    while IFS='=' read -r key value; do
+        case "$key" in
+            "user") user="$value" ;;
+            "hostname") hostname="$value" ;;
+            "port") port="$value" ;;
+            "remotePath") remote_path="$value" ;;
+            "localPath") local_path="$value" ;;
+            "options") options="$value" ;;
+        esac
+    done <<< "$(echo "$config" | tr '|' '\n')"
+    
+    # Build connection string
+    local connection_string="$hostname"
+    if [[ -n "$user" ]]; then
+        connection_string="$user@$hostname"
+    fi
+    
+    log_verbose "Mounting $server_name:"
+    log_verbose "  Connection: $connection_string:$port"
+    log_verbose "  Remote path: $remote_path"
+    log_verbose "  Local path: $local_path"
+    log_verbose "  Options: $options"
+    
+    # Create mount point if needed
+    if [[ ! -d "$local_path" ]]; then
+        mkdir -p "$local_path"
+        log_debug "Created mount point: $local_path"
+    fi
+    
+    # Check if already mounted
+    if mountpoint -q "$local_path"; then
+        log_error "Mount point '$local_path' is already mounted"
+        return 1
+    fi
+    
+    # Build sshfs command
+    local sshfs_cmd="sshfs"
+    local sshfs_options="-p $port"
+    
+    if [[ "$IGNORE_HOSTS" == true ]]; then
+        sshfs_options="$sshfs_options -o StrictHostKeyChecking=no"
+    fi
+    
+    if [[ -n "$options" ]]; then
+        sshfs_options="$sshfs_options $options"
+    fi
+
+    if [[ "$DEBUG" == true ]]; then
+        sshfs_options="$sshfs_options -d"
+    fi
+
+    log_debug "Executing: $sshfs_cmd $connection_string:$remote_path $local_path $sshfs_options"
+    
+    # Execute mount
+    if eval "$sshfs_cmd \"$connection_string:$remote_path\" \"$local_path\" $sshfs_options"; then
+        echo "$(date): Mounted $server_name ($connection_string) at $local_path" >> "$HISTORY_FILE"
+        log_info "Successfully mounted '$server_name' at '$local_path'"
+        
+        # Handle persistent mount if requested
+        if [[ "$PERSISTENT" == true ]]; then
+            log_info "Adding persistent mount entry..."
+            if add_to_fstab "$connection_string" "$remote_path" "$local_path" "$port" "$options"; then
+                log_info "Persistent mount configured successfully"
+            else
+                log_error "Failed to configure persistent mount"
+            fi
+        fi
+    else
+        log_error "Failed to mount '$server_name'"
+        return 1
+    fi
+}
+
+# Unmount server function
+umount_server() {
+    local server_name="$1"
+    
+    if [[ -z "$server_name" ]]; then
+        log_error "Server name is required for unmount"
+        return 1
+    fi
+    
+    # Try to get server config to find local path
+    local config=""
+    if get_server_config "$server_name" > /dev/null 2>&1; then
+        config=$(get_server_config "$server_name")
+    else
+        # Use default path if no config found
+        local local_path="$MOUNT_DIR/$server_name"
+        if [[ -d "$local_path" ]] && mountpoint -q "$local_path"; then
+            if fusermount -u "$local_path"; then
+                log_info "Successfully unmounted '$server_name'"
+            else
+                log_error "Failed to unmount '$server_name'"
+                return 1
+            fi
+        else
+            log_error "No active mount found for '$server_name'"
+            return 1
+        fi
+        return 0
+    fi
+    
+    # Parse config to get local path and other details
+    local local_path="" user="" hostname=""
+    while IFS='=' read -r key value; do
+        case "$key" in
+            "localPath") local_path="$value" ;;
+            "user") user="$value" ;;
+            "hostname") hostname="$value" ;;
+        esac
+    done <<< "$(echo "$config" | tr '|' '\n')"
+    
+    if [[ -n "$local_path" ]] && mountpoint -q "$local_path"; then
+        if fusermount -u "$local_path"; then
+            log_info "Successfully unmounted '$server_name' from '$local_path'"
+            
+            # Check for and offer to remove persistent mount entry
+            local connection_string="$hostname"
+            if [[ -n "$user" ]]; then
+                connection_string="$user@$hostname"
+            fi
+            
+            if grep -q "# SSHM: $connection_string" /etc/fstab 2>/dev/null; then
+                echo -e -n "${YELLOW}Remove persistent mount entry from /etc/fstab? [y/N]:${NC} "
+                read -r response
+                if [[ "$response" =~ ^[Yy]$ ]]; then
+                    remove_from_fstab "$connection_string"
+                fi
+            fi
+        else
+            log_error "Failed to unmount '$server_name'"
+            return 1
+        fi
+    else
+        log_error "No active mount found for '$server_name' at '$local_path'"
+        return 1
+    fi
+}
+
+# List mounted servers
+list_mounts() {
+    echo "Active SSHFS mounts:"
+    mount | grep "type fuse.sshfs" | while read -r line; do
+        local mount_line="$line"
+        local server
+        server=$(echo "$mount_line" | cut -d' ' -f1)
+        local mount_point
+        mount_point=$(echo "$mount_line" | cut -d' ' -f3)
+        echo "  $server -> $mount_point"
+    done
+}
+
+# Show configuration
+show_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        echo "Configuration file: $CONFIG_FILE"
+        echo "Configuration:"
+        jq '.' "$CONFIG_FILE" 2>/dev/null || cat "$CONFIG_FILE"
+    else
+        log_error "No configuration file found. Run '$SCRIPT_NAME --init' to initialize."
+    fi
+}
+
+# Show status (config + mounts)
+show_status() {
+    echo "=== SSHM Status ==="
+    echo
+    show_config
+    echo
+    list_mounts
+}
+
+# Remove server configuration
+remove_server() {
+    local server_name="$1"
+    
+    if [[ -z "$server_name" ]]; then
+        log_error "Server name is required"
+        return 1
+    fi
+    
+    check_jq
+    
+    if ! get_server_config "$server_name" > /dev/null 2>&1; then
+        log_error "Server '$server_name' not found in configuration"
+        return 1
+    fi
+    
+    # Remove from JSON
+    local temp_config
+    temp_config=$(mktemp)
+    jq "del(.servers[\"$server_name\"])" "$CONFIG_FILE" > "$temp_config" && mv "$temp_config" "$CONFIG_FILE"
+    
+    log_info "Server '$server_name' removed from configuration"
+}
+
+# Add entry to /etc/fstab for persistent mounting
+add_to_fstab() {
+    local connection_string="$1"
+    local remote_path="$2" 
+    local local_path="$3"
+    local port="$4"
+    local options="$5"
+
+    # Check for existing identity file for the current server name in the format of id_ed25519_<server_name>
+    local identity_file
+    identity_file="$HOME/.ssh/id_ed25519_${connection_string#*@}"
+    if [[ -f "$identity_file" ]]; then
+        log_info "Using existing identity file: $identity_file"
+    else
+        log_warning "No identity file found for $connection_string"
+        log_error "An identity file is required for persistent mounting"
+        return 1
+    fi
+
+    # Clean up options for fstab (remove -o prefix and quotes)
+    local clean_options="${options#-o }"
+    clean_options="${clean_options#-o}"
+    # Remove quotes from options for fstab compatibility
+    clean_options="${clean_options//\'/}"
+    # Escape spaces only within sftp_server option values for fstab compatibility
+    # shellcheck disable=SC2001
+    clean_options=$(echo "$clean_options" | sed 's/sftp_server=sudo \([^,]*\)/sftp_server=sudo\\040\1/')
+
+    # fstab entry must have user@host since we are providing a user-specific mount
+    local fstab_entry="$USER@$connection_string:$remote_path $local_path fuse.sshfs $clean_options,port=$port,user,_netdev,IdentityFile=$identity_file 0 0"
+    local fstab_comment="# SSHM: $connection_string"
+    
+    # Check if entry already exists
+    if grep -q "# SSHM: $connection_string" /etc/fstab 2>/dev/null; then
+        log_info "Persistent mount entry already exists in /etc/fstab"
+        return 0
+    fi
+    
+    # Create backup of fstab
+    if sudo cp /etc/fstab /etc/fstab.backup.sshm; then
+        log_verbose "Created backup of /etc/fstab"
+    else
+        log_error "Failed to create backup of /etc/fstab"
+        return 1
+    fi
+    
+    # Add entry to fstab
+    # Check if /etc/fstab ends with at least two newlines
+    if [[ $(tail -c 2 /etc/fstab | tr -d '\n' | wc -c) -eq 0 ]]; then
+        # Already ends with two newlines, just append
+        if printf "%s\n%s\n" "$fstab_comment" "$fstab_entry" | sudo tee -a /etc/fstab > /dev/null; then
+            log_info "Added persistent mount entry to /etc/fstab"
+            log_info "Mount will survive reboots. Use 'mount $local_path' to mount after reboot."
+            return 0
+        else
+            log_error "Failed to add entry to /etc/fstab"
+            return 1
+        fi
+    else
+        # Add an extra newline before appending
+        if printf "\n%s\n%s\n" "$fstab_comment" "$fstab_entry" | sudo tee -a /etc/fstab > /dev/null; then
+            log_info "Added persistent mount entry to /etc/fstab"
+            log_info "Mount will survive reboots. Use 'mount $local_path' to mount after reboot."
+            return 0
+        else
+            log_error "Failed to add entry to /etc/fstab"
+            return 1
+        fi
+    fi
+}
+
+# Remove entry from /etc/fstab
+remove_from_fstab() {
+    local connection_string="$1"
+    local fstab_comment="# SSHM: $connection_string"
+    
+    if ! grep -q "$fstab_comment" /etc/fstab 2>/dev/null; then
+        log_verbose "No persistent mount entry found in /etc/fstab for $connection_string"
+        return 0
+    fi
+    
+    # Create backup of fstab
+    if sudo cp /etc/fstab /etc/fstab.backup.sshm; then
+        log_verbose "Created backup of /etc/fstab"
+    else
+        log_error "Failed to create backup of /etc/fstab"
+        return 1
+    fi
+    
+    # Remove the comment and the following line
+    if sudo sed -i "/^# SSHM: $connection_string$/,+1d" /etc/fstab; then
+        log_info "Removed persistent mount entry from /etc/fstab"
+        return 0
+    else
+        log_error "Failed to remove entry from /etc/fstab"
+        return 1
+    fi
+}
+
+# Edit server configuration
+edit_server() {
+    local server_name="$1"
+    
+    if [[ -z "$server_name" ]]; then
+        log_error "Server name is required"
+        return 1
+    fi
+    
+    if ! get_server_config "$server_name" > /dev/null 2>&1; then
+        log_error "Server '$server_name' not found in configuration"
+        return 1
+    fi
+    
+    # Use add_server in non-batch mode to edit
+    add_server "$server_name"
+}
+
+# Main argument parsing and execution
+main() {
+    # Handle no arguments
+    if [[ $# -eq 0 ]]; then
+        usage
+        exit 0
+    fi
+    
+    # Ensure a valid, repaired config exists before running real operations.
+    # Skip for purely informational flags and the self-initializing --init.
+    case "$1" in
+        --version|-\?|-h|--help|--init)
+            : ;;
+        *)
+            ensure_config ;;
+    esac
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -i|--ignore)
+                IGNORE_HOSTS=true
+                shift
+                ;;
+            -p|--persistent)
+                PERSISTENT=true
+                shift
+                ;;
+            -d|--debug)
+                DEBUG=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                DEBUG=true
+                shift
+                ;;
+            -c|--clear)
+                if [[ -f "$HISTORY_FILE" ]]; then
+                    true > "$HISTORY_FILE"
+                    log_info "SSHM history cleared"
+                else
+                    log_info "No history file found"
+                fi
+                exit 0
+                ;;
+            --init)
+                init_config
+                exit 0
+                ;;
+            --version)
+                echo "$SCRIPT_NAME version $VERSION"
+                exit 0
+                ;;
+            -\?|-h|--help)
+                usage
+                exit 0
+                ;;
+            mount)
+                shift
+                if [[ -n "$1" ]]; then
+                    mount_server "$1"
+                    exit $?
+                else
+                    log_error "Mount command requires a server name"
+                    exit 1
+                fi
+                ;;
+            umount)
+                shift
+                if [[ -n "$1" ]]; then
+                    umount_server "$1"
+                    exit $?
+                else
+                    log_error "Umount command requires a server name"
+                    exit 1
+                fi
+                ;;
+            list)
+                list_mounts
+                exit $?
+                ;;
+            add)
+                shift
+                if [[ -n "$1" ]]; then
+                    add_server "$1"
+                    exit $?
+                else
+                    log_error "Add command requires a server name"
+                    exit 1
+                fi
+                ;;
+            edit)
+                shift
+                if [[ -n "$1" ]]; then
+                    edit_server "$1"
+                    exit $?
+                else
+                    log_error "Edit command requires a server name"
+                    exit 1
+                fi
+                ;;
+            remove)
+                shift
+                if [[ -n "$1" ]]; then
+                    remove_server "$1"
+                    exit $?
+                else
+                    log_error "Remove command requires a server name"
+                    exit 1
+                fi
+                ;;
+            status)
+                show_status
+                exit $?
+                ;;
+            config)
+                show_config
+                exit $?
+                ;;
+            *)
+                # Treat as hostname or user@hostname to mount
+                mount_server "$1"
+                exit $?
+                ;;
+        esac
+    done
+}
+
+main "$@"

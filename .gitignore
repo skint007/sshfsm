@@ -1,0 +1,13 @@
+# Build artifacts (makepkg)
+pkg/
+src/
+*.pkg.tar.zst
+*.pkg.tar.xz
+
+# Editor / tooling
+.vscode/
+.claude/
+CLAUDE.md
+
+# Local config / runtime
+*.log
