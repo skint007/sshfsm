@@ -5,6 +5,7 @@ set -e
 SCRIPT_NAME="sshm"
 BIN_DIR="$HOME/.local/bin"
 COMPLETION_DIR="/etc/bash_completion.d"
+ZSH_COMPLETION_DIR="/usr/share/zsh/site-functions"
 
 # Colors for output
 RED='\033[0;31m'
@@ -88,7 +89,7 @@ install_script() {
     # Copy script to bin directory
     cp "$SCRIPT_NAME" "$BIN_DIR/$SCRIPT_NAME"
     chmod +x "$BIN_DIR/$SCRIPT_NAME"
-    chown $USER:$USER "$BIN_DIR/$SCRIPT_NAME"
+    chown "$USER:$USER" "$BIN_DIR/$SCRIPT_NAME"
 
     log_info "Script installed to $BIN_DIR/$SCRIPT_NAME"
 }
@@ -118,6 +119,31 @@ install_completion() {
     log_info "Completion will be available in new shell sessions"
 }
 
+install_zsh_completion() {
+    log_info "Installing zsh completion..."
+
+    if [[ ! -f "sshm-completion.zsh" ]]; then
+        log_warn "Completion file 'sshm-completion.zsh' not found, skipping zsh completion install"
+        return
+    fi
+
+    if [[ -f "$ZSH_COMPLETION_DIR/_sshm" ]]; then
+        log_info "Zsh completion already installed at $ZSH_COMPLETION_DIR/_sshm, skipping"
+        return
+    fi
+
+    # Create completion directory if it doesn't exist
+    if [[ ! -d "$ZSH_COMPLETION_DIR" ]]; then
+        sudo mkdir -p "$ZSH_COMPLETION_DIR"
+    fi
+
+    # Install completion (function file must be named _sshm on $fpath)
+    sudo cp "sshm-completion.zsh" "$ZSH_COMPLETION_DIR/_sshm"
+
+    log_info "Zsh completion installed to $ZSH_COMPLETION_DIR/_sshm"
+    log_info "Run 'compinit' or start a new shell, and ensure $ZSH_COMPLETION_DIR is on your \$fpath"
+}
+
 verify_installation() {
     log_info "Verifying installation..."
     
@@ -143,6 +169,9 @@ show_usage_info() {
     echo "For bash completion to work in current session, run:"
     echo "  source $COMPLETION_DIR/sshm"
     echo ""
+    echo "For zsh completion, ensure $ZSH_COMPLETION_DIR is on your \$fpath,"
+    echo "then run 'compinit' or start a new shell."
+    echo ""
     echo "Configuration will be stored in: ~/.config/sshm/"
 }
 
@@ -155,6 +184,7 @@ main() {
     check_dependencies
     install_script
     install_completion
+    install_zsh_completion
     verify_installation
     show_usage_info
 }
@@ -169,7 +199,7 @@ case "${1:-}" in
         echo "This script will:"
         echo "  1. Check for and install dependencies (sshfs, jq)"
         echo "  2. Install sshm to /usr/bin/"
-        echo "  3. Install bash completion"
+        echo "  3. Install bash and zsh completion"
         echo "  4. Verify the installation"
         exit 0
         ;;

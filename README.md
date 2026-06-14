@@ -10,7 +10,7 @@ A simplified bash script for easily mounting remote servers using SSHFS with int
 - **JSON configuration**: Clean, readable config in `~/.config/sshm/sshm.json`
 - **Persistent mounts**: Optionally add mounts to `/etc/fstab` to survive reboots
 - **sftp-server auto-detection**: Automatically locates `sftp-server` during initialization
-- **Bash completion**: Tab completion for commands and configured server names
+- **Shell completion**: Tab completion for commands and configured server names (bash and zsh)
 
 ## Installation
 
@@ -32,6 +32,15 @@ This will:
 - Check for and install dependencies (on Arch Linux)
 - Copy `sshm` to `~/.local/bin/sshm`
 - Install bash completion to `/etc/bash_completion.d/`
+- Install zsh completion to `/usr/share/zsh/site-functions/_sshm`
+
+For zsh, make sure the completion directory is on your `$fpath` and `compinit` has run
+(both are the default on most zsh setups). Add this to `~/.zshrc` if needed:
+
+```zsh
+fpath=(/usr/share/zsh/site-functions $fpath)
+autoload -Uz compinit && compinit
+```
 
 ## Quick Start
 
@@ -103,7 +112,7 @@ During `--init`, sshm automatically detects the location of `sftp-server` on you
 ### Example Configuration File
 ```json
 {
-  "version": "2.3.1",
+  "version": "2.4.0",
   "defaults": {
     "port": 22,
     "remotePath": "/",

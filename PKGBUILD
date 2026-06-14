@@ -1,6 +1,6 @@
 # Maintainer: skint007 <archlinux.repose742@passmail.net>
 pkgname=sshm
-pkgver=2.3.1
+pkgver=2.4.0
 pkgrel=1
 pkgdesc="SSH File System Mount Manager - simplified bash script for mounting remote servers using sshfs"
 arch=('any')
@@ -10,8 +10,10 @@ depends=('bash' 'sshfs' 'jq' 'fuse2')
 optdepends=('openssh: for SSH connections')
 source=('sshm'
         'sshm-completion.bash'
+        'sshm-completion.zsh'
         'README.md')
 sha256sums=('SKIP'
+            'SKIP'
             'SKIP'
             'SKIP')
 
@@ -21,7 +23,10 @@ package() {
     
     # Install bash completion
     install -Dm644 "$srcdir/sshm-completion.bash" "$pkgdir/etc/bash_completion.d/sshm"
-    
+
+    # Install zsh completion
+    install -Dm644 "$srcdir/sshm-completion.zsh" "$pkgdir/usr/share/zsh/site-functions/_sshm"
+
     # Install documentation
     install -Dm644 "$srcdir/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
 }
