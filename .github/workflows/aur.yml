@@ -1,0 +1,72 @@
+name: Publish AUR Package
+
+# Publishes the `sshfsm` package to the AUR when a version tag (v*) is pushed.
+# The GitHub-generated source tarball for the tag is what the PKGBUILD downloads,
+# so it is available as soon as the tag exists.
+on:
+  push:
+    tags: ['v*']
+
+# Avoid overlapping publishes if several tags are pushed in quick succession.
+concurrency:
+  group: aur-publish
+  cancel-in-progress: false
+
+jobs:
+  aur:
+    runs-on: ubuntu-latest
+    container: archlinux:base
+
+    steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm git openssh pacman-contrib
+
+      - uses: actions/checkout@v4
+
+      - name: Resolve version from tag
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Update PKGBUILD version
+        run: |
+          sed -i "s/^pkgver=.*/pkgver=${VERSION}/" aur/PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" aur/PKGBUILD
+
+      - name: Update checksums and generate .SRCINFO
+        run: |
+          # makepkg/updpkgsums refuse to run as root, so use an unprivileged user
+          useradd -m builder
+          chown -R builder aur
+          su builder -c "cd aur && updpkgsums && makepkg --printsrcinfo > .SRCINFO"
+
+      - name: Push to AUR
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          AUR_EMAIL: ${{ secrets.AUR_EMAIL }}
+        run: |
+          # Set up SSH for AUR
+          mkdir -p ~/.ssh
+          echo "$AUR_SSH_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o StrictHostKeyChecking=accept-new"
+
+          # Clone the AUR package repo (must already exist / be created on first push)
+          git clone ssh://aur@aur.archlinux.org/sshfsm.git /tmp/aur-repo
+          cd /tmp/aur-repo
+          git checkout master 2>/dev/null || git checkout -b master
+
+          # Copy the generated package files
+          cp "$GITHUB_WORKSPACE/aur/PKGBUILD" .
+          cp "$GITHUB_WORKSPACE/aur/.SRCINFO" .
+          cp "$GITHUB_WORKSPACE/aur/"*.install . 2>/dev/null || true
+
+          # Commit and push only if something actually changed
+          git config user.name "skint007"
+          git config user.email "$AUR_EMAIL"
+          git add PKGBUILD .SRCINFO
+          git add ./*.install 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No changes to push"
+          else
+            git commit -m "Update sshfsm to ${VERSION}"
+            git push origin master
+          fi

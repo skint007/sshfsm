@@ -3,6 +3,10 @@ pkg/
 src/
 *.pkg.tar.zst
 *.pkg.tar.xz
+# Downloaded source tarballs fetched by makepkg in aur/
+aur/*.tar.gz
+aur/*.tar.xz
+aur/*.tar.zst
 
 # Editor / tooling
 .vscode/

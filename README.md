@@ -16,10 +16,13 @@ A simplified bash script for easily mounting remote servers using SSHFS with int
 
 ### From AUR (Arch Linux)
 
+The AUR package is named **`sshfsm`** (it installs the `sshm` command):
+
 ```bash
-yay -S sshm
-# or
-makepkg -si
+yay -S sshfsm
+# or build it manually
+git clone https://aur.archlinux.org/sshfsm.git
+cd sshfsm && makepkg -si
 ```
 
 ### Manual Install
